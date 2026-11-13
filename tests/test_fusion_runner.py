@@ -347,7 +347,7 @@ class NoAucEvaluator:
 def test_plugged_in_evaluator_gets_eval_input_and_replaces_scorer(cache, tmp_path):
     RecordingEvaluator.calls.clear()
     out = tmp_path / "ev"
-    s = FR.run(cfg(out, cache=str(cache), seeds=[0], save_checkpoints=False,
+    s = FR.run(cfg(out, cache=str(cache), seeds=[0], save_checkpoints=False, bootstrap=0,
                    evaluator="test_fusion_runner:make_recording_evaluator"))
     assert "episode_scorer" not in s["provisional"] and "probe" in s["provisional"]  # B6 still pending
     assert s["evaluator"] == "test_eval" and "extra_metric" in s["metrics"]
@@ -400,3 +400,123 @@ def test_proj_dim_reaches_the_model(cache, tmp_path):
     FR.run(cfg(out, cache=str(cache), seeds=[0], proj_dim=8))
     ck = torch.load(out / "seed0" / "model.pt", weights_only=False)
     assert ck["model_kwargs"]["proj_dim"] == 8 and any(k.startswith("proj.") for k in ck["model_state"])
+
+
+# --------------------------------------------------------------------------- bootstrap CIs, step-score files
+
+def test_bootstrap_ci_written_and_matches_sweep_file_layout(cache, tmp_path):
+    out = tmp_path / "boot"
+    s = FR.run(cfg(out, cache=str(cache), seeds=[0, 1], save_checkpoints=False, bootstrap=200))
+    for k in ("roc_auc", "pr_auc", "tpr_at_5_fpr"):
+        lo, hi = s["metrics"][k]["ci"]
+        assert 0 <= lo <= hi <= 1
+    lo, hi = s["metrics"]["roc_auc"]["ci"]
+    assert lo <= s["metrics"]["roc_auc"]["mean"] <= hi
+    assert s["bootstrap"]["n_resamples"] == 200 and "stratified" in s["bootstrap"]["scheme"]
+    assert "95% CI [" in pd.read_csv(out / "sheet_row.csv").Notes.iloc[0]
+    with np.load(out / "seed0" / FR.STEP_SCORES) as z:  # the depth sweep's rows/*.scores.npz keys
+        assert set(z.files) == {"step_scores", "offsets", "labels", "horizons", "task_ids", "trajectory_ids"}
+    d = FR.load_step_scores(out / "seed0" / FR.STEP_SCORES)
+    csv = pd.read_csv(out / "seed0" / "seen_val_episode_scores.csv").set_index("trajectory_id")
+    for sc, tid in zip(d.step_scores, d.trajectory_ids):  # episode score = max of the saved step logits
+        assert float(np.max(sc)) == pytest.approx(csv.loc[tid, "score"], abs=1e-5)
+    again = FR.add_bootstrap(out, 200)  # deterministic for a fixed seed
+    assert again["metrics"]["roc_auc"]["ci"] == s["metrics"]["roc_auc"]["ci"]
+
+
+def test_bootstrap_off_and_bad_settings(tmp_path):
+    s = FR.run(cfg(tmp_path / "nb", synthetic=True, seeds=[0], epochs=1, bootstrap=0))
+    assert "ci" not in s["metrics"]["roc_auc"]
+    for kw in ({"bootstrap": -1}, {"ci": 1.0}, {"latency_device": "tpu"}, {"std_floor": 0.0},
+               {"std_floor": 1e-2, "normalize": False}, {"overwrite": True, "resume": True}):
+        with pytest.raises(ValueError):
+            FR.validate_config(cfg(tmp_path / "x", synthetic=True, **kw))
+
+
+def test_stratified_resamples_keep_class_counts():
+    y = np.array([1, 0, 0, 1, 0, 0, 0])
+    for idx in FR.stratified_indices(y, 50, 0):
+        assert len(idx) == len(y) and y[idx].sum() == y.sum()
+
+
+# --------------------------------------------------------------------------- memory, sequential reads, std floor
+
+def test_memory_check_refuses_before_loading(cache, tmp_path, monkeypatch):
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "100")  # 0.1 GB job
+    with pytest.raises(ValueError, match="exceeds 90%"):
+        FR.run(cfg(tmp_path / "m", cache=str(cache), seeds=[0]))
+    FR.run(cfg(tmp_path / "m2", cache=str(cache), seeds=[0], epochs=1, memory_check=False, bootstrap=0,
+               save_checkpoints=False))
+
+
+def test_memory_limit_sources(monkeypatch):
+    monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    monkeypatch.setenv("SLURM_MEM_PER_CPU", "2048")
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "4")
+    assert FR.memory_limit_gb() == pytest.approx(8.0)
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "16384")
+    assert FR.memory_limit_gb() == pytest.approx(16.0)
+
+
+def test_sequential_preload_gives_identical_records_and_frees_files(cache, tmp_path):
+    splits, _ = FR.load_cache_splits(cfg(tmp_path, cache=str(cache), layers=[16, 33]))
+    ref = load_cache.SharedCache(cache)
+    for split, horizon in (("train", "full"), ("seen_val", "task_min_step")):
+        want = ref.records(split, [16, 33], normalize=True, horizon=horizon)
+        assert all(torch.equal(a["features"], b["features"]) for a, b in zip(splits[split], want))
+
+
+def test_preload_refuses_unseen(cache):
+    with pytest.raises(PermissionError):
+        FR._preload_sequential(load_cache.SharedCache(cache), "mean", "unseen_test", [16])
+
+
+def test_std_floor_caps_the_blowup(cache, tmp_path, capsys):
+    splits, prov = FR.load_cache_splits(cfg(tmp_path, cache=str(cache), layers=[16], std_floor=1e-2))
+    peak = max(float(r["features"].abs().max()) for recs in splits.values() for r in recs)
+    assert peak < 1e4 and prov["std_floor"] == 1e-2  # the loader's 1e-6 floor gives ~2e6 on this fixture
+    c = load_cache.SharedCache(cache)
+    mean, std = c.norm_stats("mean", [16])
+    raw = c.records("train", [16], normalize=False)[0]["features"]
+    want = (raw - torch.from_numpy(mean)) / torch.from_numpy(np.maximum(std, 1e-2))
+    assert torch.allclose(splits["train"][0]["features"], want)
+
+
+# --------------------------------------------------------------------------- resume
+
+def test_resume_keeps_finished_seeds_and_refuses_a_changed_config(cache, tmp_path, monkeypatch):
+    out = tmp_path / "res"
+    FR.run(cfg(out, cache=str(cache), seeds=[0], bootstrap=0, save_checkpoints=False))
+    before = (out / "seed0" / "metrics.json").read_text()
+    trained = []
+    orig = FR.train_one
+    monkeypatch.setattr(FR, "train_one", lambda m, tr, va, c, seed, ev=None: (trained.append(seed),
+                                                                             orig(m, tr, va, c, seed, ev))[1])
+    s = FR.run(cfg(out, cache=str(cache), seeds=[0, 1], bootstrap=0, save_checkpoints=False, resume=True))
+    assert trained == [1] and (out / "seed0" / "metrics.json").read_text() == before
+    assert s["seeds"] == [0, 1] and s["metrics"]["roc_auc"]["n_seeds_defined"] == 2
+    loads = []
+    monkeypatch.setattr(FR, "load_cache_splits", lambda c: loads.append(1))
+    FR.run(cfg(out, cache=str(cache), seeds=[0, 1], bootstrap=50, resume=True))  # all done: no data read
+    assert loads == [] and "ci" in json.loads((out / "summary.json").read_text())["metrics"]["roc_auc"]
+    with pytest.raises(FileExistsError, match="different configuration"):
+        FR.run(cfg(out, cache=str(cache), seeds=[0], lr=0.5, resume=True))
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "x.txt").write_text("keep")
+    with pytest.raises(FileExistsError, match="not written by this runner"):
+        FR.run(cfg(foreign, cache=str(cache), seeds=[0], resume=True))
+
+
+def test_resume_on_an_empty_folder_is_a_fresh_run(tmp_path):
+    s = FR.run(cfg(tmp_path / "fresh", synthetic=True, seeds=[0], epochs=1, bootstrap=0, resume=True))
+    assert s["seeds"] == [0]
+
+
+# --------------------------------------------------------------------------- other fusion models (F4/F5 may win F6)
+
+@pytest.mark.parametrize("model", ["gated_fusion", "residual_fusion"])
+def test_runner_works_with_the_other_fusion_models(cache, tmp_path, model):
+    s = FR.run(cfg(tmp_path / model, model=model, cache=str(cache), seeds=[0], epochs=1, bootstrap=20,
+                   save_checkpoints=False))
+    assert s["sheet_row"]["Parameters"] > 0 and "ci" in s["metrics"]["roc_auc"]

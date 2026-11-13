@@ -15,8 +15,11 @@ experiment:
     - failure_prob/models/probe_heads.py
     - failure_prob/fusion_runner.py
     - failure_prob/fusion_experiments.py
+    - failure_prob/fusion_compare.py
     - scripts/run_fusion.py
     - scripts/fusion_experiments.py
+    - scripts/fusion_compare.py
+    - scripts/carc/fusion.slurm
   configs:
     - configs/models/concat_fusion.yaml
     - configs/models/static_weight_fusion.yaml
@@ -25,7 +28,9 @@ experiment:
   depends_on: [B6 probe spec, B4 evaluator, R1 depth sweep, S1-S3 layer sets, B7 (F3 overlaps its static-weights model)]
   protocol: train on train (full horizon, as the R1 sweep); score seen_val per rollout at task_min_step; seeds 0/1/2
   selection_split: seen_val (layer sets and the compact lr/dropout/weight-decay search)
-  metrics: percent 0-100 (ROC-AUC, PR-AUC, TPR@5%FPR), plus trainable parameters and detector latency (ms per step)
+  metrics: percent 0-100 (ROC-AUC, PR-AUC, TPR@5%FPR) with 95% stratified bootstrap CIs over seen_val episodes, plus trainable parameters and detector latency (ms per step)
+  significance: scripts/fusion_compare.py (paired bootstrap CI of the difference vs the best single layer or another row)
+  carc: sbatch scripts/carc/fusion.slurm {a9|search|kcurve|run|compare} <args>; --resume after a time-out
   commands:
     F1: python scripts/fusion_experiments.py search --model concat_fusion --layers <S2 pair> --cache "$CACHE" --output-dir outputs/fusion/F1 --label "F1 two-layer concat"
     F2: python scripts/fusion_experiments.py search --model concat_fusion --layers <S3 early middle late> --cache "$CACHE" --output-dir outputs/fusion/F2 --label "F2 three-layer concat"

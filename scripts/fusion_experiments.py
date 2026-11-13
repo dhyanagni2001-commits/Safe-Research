@@ -39,6 +39,8 @@ def main(argv=None) -> int:
     s.add_argument("--label", default=None, help="Experiment name in the sheet row (e.g. 'F1 two-layer concat')")
     k = sub.add_parser("kcurve", parents=[common_parser()], help="F6: K = 1..4 on the ranked layer list")
     k.add_argument("--ks", type=int, nargs="+", default=[1, 2, 3, 4])
+    k.add_argument("--reference-layer", type=int, default=None,
+                   help="R1's best single layer; also run as K=1 when it is not the first ranked layer")
     k.add_argument("--label", default=None)
     a = ap.parse_args(argv)
     cfg = to_config(a)
@@ -46,7 +48,7 @@ def main(argv=None) -> int:
         if a.cmd == "search":
             FX.hparam_search(cfg, {"lr": a.lrs, "dropout": a.dropouts, "weight_decay": a.weight_decays}, label=a.label)
         else:
-            FX.k_ablation(cfg, a.ks, label=a.label)
+            FX.k_ablation(cfg, a.ks, label=a.label, reference_layer=a.reference_layer)
     except (ValueError, FileExistsError, FileNotFoundError, PermissionError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

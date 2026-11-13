@@ -58,6 +58,15 @@ def common_parser() -> argparse.ArgumentParser:
     p.add_argument("--init-weights", type=float, nargs="+", help="static_weight_fusion: one value per layer")
     p.add_argument("--proj-dim", type=int, default=None, help="static_weight_fusion: project every layer to this "
                    "shared dimension before the weighted sum (F3 uses 64); omit for a pure scalar mix")
+    p.add_argument("--std-floor", type=float, default=None, help="normalize with max(train std, this) instead of "
+                   "the loader's 1e-6 floor (e.g. 1e-2 if the run warns that normalized features blow up)")
+    p.add_argument("--bootstrap", type=int, default=1000, help="seen_val bootstrap resamples for CIs (0 = off)")
+    p.add_argument("--ci", type=float, default=0.95)
+    p.add_argument("--latency-device", default="cpu", choices=["cpu", "cuda"])
+    p.add_argument("--no-memory-check", dest="memory_check", action="store_false",
+                   help="load even if the memory estimate exceeds the job's limit")
+    p.add_argument("--resume", action="store_true", help="keep finished seeds of an identical earlier run "
+                   "(e.g. after a Slurm time-out) and train only the missing ones")
     p.add_argument("--overwrite", action="store_true", help="replace a non-empty --output-dir")
     p.add_argument("--no-checkpoints", dest="save_checkpoints", action="store_false")
     return p

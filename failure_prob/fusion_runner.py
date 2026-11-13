@@ -132,6 +132,12 @@ class RunConfig:
     learn_weights: bool = True          # static_weight_fusion only
     init_weights: list[float] | None = None  # static_weight_fusion only
     proj_dim: int | None = None         # static_weight_fusion only: per-layer projection to a shared dimension
+    std_floor: float | None = None      # normalize with max(train std, std_floor) instead of the loader's 1e-6 floor
+    bootstrap: int = 1000               # stratified bootstrap resamples of seen_val episodes for CIs (0 = off)
+    ci: float = 0.95                    # CI level
+    latency_device: str = "cpu"         # cpu | cuda
+    memory_check: bool = True           # refuse to load when the estimated memory exceeds the job's limit
+    resume: bool = False                # keep finished seeds of an identical earlier run, train only the missing ones
     overwrite: bool = False
     save_checkpoints: bool = True
 
@@ -163,6 +169,16 @@ def validate_config(cfg: RunConfig, need_source: bool = True) -> None:
             raise ValueError(f"{name} must be >= 1")
     if cfg.lr <= 0 or cfg.weight_decay < 0 or cfg.grad_clip < 0 or not 0 <= cfg.dropout < 1:
         raise ValueError("need lr > 0, weight_decay >= 0, grad_clip >= 0 and 0 <= dropout < 1")
+    if cfg.std_floor is not None and (not cfg.normalize or not cfg.std_floor > 0):
+        raise ValueError("std_floor needs normalize=True and a value > 0")
+    if cfg.bootstrap < 0 or not 0 < cfg.ci < 1:
+        raise ValueError("need bootstrap >= 0 and 0 < ci < 1")
+    if cfg.latency_device not in ("cpu", "cuda"):
+        raise ValueError(f"latency_device must be cpu or cuda, got {cfg.latency_device!r}")
+    if cfg.latency_device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("latency_device='cuda' but no GPU is visible")
+    if cfg.overwrite and cfg.resume:
+        raise ValueError("choose overwrite or resume, not both")
     if cfg.proj_dim is not None and cfg.proj_dim < 1:
         raise ValueError(f"proj_dim must be >= 1, got {cfg.proj_dim}")
     if cfg.init_weights is not None and len(cfg.init_weights) != len(cfg.layers):
@@ -193,6 +209,56 @@ def _shared_cache(root):
     return SharedCache(root)
 
 
+def memory_limit_gb() -> float | None:
+    """The job's memory limit: Slurm's allocation when inside a job, else the machine's physical memory."""
+    env = os.environ
+    try:
+        if env.get("SLURM_MEM_PER_NODE"):
+            return float(env["SLURM_MEM_PER_NODE"]) / 1024
+        if env.get("SLURM_MEM_PER_CPU"):
+            cpus = int(env.get("SLURM_CPUS_PER_TASK") or env.get("SLURM_CPUS_ON_NODE") or 1)
+            return float(env["SLURM_MEM_PER_CPU"]) * cpus / 1024
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024 ** 3
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _steps(eps, split: str, horizon: str) -> int:
+    e = eps[eps.split == split]
+    return int(e.length.sum() if horizon == "full" else np.minimum(e.length, e.task_min_step).sum())
+
+
+def estimate_memory_gb(cache, cfg: RunConfig) -> dict:
+    """Peak estimate: float32 records of both splits (K x D per step) + one split's float16 layer files held while
+    its records are built + 1 GB for torch/the model. Feature width read from the layer file header."""
+    eps = cache.episodes
+    path = Path(cfg.cache) / "features" / cfg.pool / "train" / f"L{cfg.layers[0]:02d}.npy"
+    d = int(np.load(path, mmap_mode="r").shape[1])
+    k = len(cfg.layers)
+    recs = sum(_steps(eps, s, cfg.train_horizon if s == "train" else cfg.horizon) for s in DEV_SPLITS) * k * d * 4
+    files = max(int(eps[eps.split == s].length.sum()) for s in DEV_SPLITS) * k * d * 2  # whole split files
+    return {"records_gb": recs / 1024 ** 3, "files_gb": files / 1024 ** 3,
+            "total_gb": (recs + files) / 1024 ** 3 + 1.0, "feature_dim": d}
+
+
+def _preload_sequential(cache, pool: str, split: str, layers) -> None:
+    """Read each layer file of `split` in one sequential pass into the loader's array cache (instead of memory-mapped
+    random slices, which stalled on /scratch1 under load). Only train / seen_val are ever read here."""
+    if split not in DEV_SPLITS:
+        raise PermissionError(f"refusing to read {split}")
+    mm = getattr(cache, "_mm", None)
+    if not isinstance(mm, dict):
+        return
+    for layer in layers:
+        path = Path(cache.root) / "features" / pool / split / f"L{layer:02d}.npy"
+        if not path.exists():
+            return  # let the loader raise its own readable error
+        t0 = time.time()
+        mm[(pool, split, layer)] = np.load(path)
+        print(f"read {split}/L{layer:02d} ({path.stat().st_size / 1024 ** 3:.2f} GB) in {time.time() - t0:.0f} s",
+              file=sys.stderr, flush=True)
+
+
 def load_cache_splits(cfg: RunConfig) -> tuple[dict[str, list[dict]], dict]:
     """train + seen_val records from the shared cache, plus provenance. Never requests unseen_test."""
     cache = _shared_cache(cfg.cache)
@@ -201,12 +267,36 @@ def load_cache_splits(cfg: RunConfig) -> tuple[dict[str, list[dict]], dict]:
         bad = [l for l in cfg.layers if not 0 <= l < len(names)]
         if bad:
             raise ValueError(f"layers {bad} not in this cache (valid 0..{len(names) - 1})")
+    pools = cache.manifest.get("pools_exported")
+    if pools is not None and cfg.pool not in pools:
+        raise ValueError(f"pool {cfg.pool!r} not in this cache (pools_exported: {list(pools)})")
+    est = estimate_memory_gb(cache, cfg)
+    limit = memory_limit_gb()
+    print(f"memory estimate {est['total_gb']:.1f} GB for {len(cfg.layers)} layers (limit "
+          f"{'unknown' if limit is None else f'{limit:.1f} GB'})", file=sys.stderr, flush=True)
+    if cfg.memory_check and limit is not None and est["total_gb"] > 0.9 * limit:
+        raise ValueError(f"estimated {est['total_gb']:.1f} GB exceeds 90% of the {limit:.1f} GB available; request "
+                         f"more memory (sbatch --mem) or fewer layers (memory_check=False / --no-memory-check skips)")
+    floor_stats = None
+    if cfg.std_floor is not None:
+        mean, std = cache.norm_stats(cfg.pool, list(cfg.layers))
+        floor_stats = (torch.from_numpy(mean), torch.from_numpy(np.maximum(std, cfg.std_floor)))
+        print(f"std floor {cfg.std_floor:g}: raises {int((std < cfg.std_floor).sum())} train-std values",
+              file=sys.stderr)
     eps = cache.episodes
     out = {}
     for split in DEV_SPLITS:
         horizon = cfg.train_horizon if split == "train" else cfg.horizon
-        recs = cache.records(split, layers=list(cfg.layers), pool=cfg.pool, normalize=cfg.normalize,
-                             horizon=horizon)
+        _preload_sequential(cache, cfg.pool, split, cfg.layers)
+        try:
+            recs = cache.records(split, layers=list(cfg.layers), pool=cfg.pool,
+                                 normalize=cfg.normalize and floor_stats is None, horizon=horizon)
+        finally:
+            for layer in cfg.layers:  # the records hold their own float32 copies
+                getattr(cache, "_mm", {}).pop((cfg.pool, split, layer), None)
+        if floor_stats is not None:
+            for r in recs:
+                r["features"] = (r["features"] - floor_stats[0]) / floor_stats[1]
         rows = eps[eps.split == split].set_index("trajectory_id")
         for r in recs:
             tid = r["trajectory_ids"][0]
@@ -221,13 +311,14 @@ def load_cache_splits(cfg: RunConfig) -> tuple[dict[str, list[dict]], dict]:
     if cfg.normalize:
         peak = max(float(r["features"].abs().max()) for recs in out.values() for r in recs)
         if peak > 1e3:
-            print(f"WARNING: normalized features reach |x|={peak:.3g}; some dimension has ~0 train std (std floor "
-                  f"1e-6). Check norm_stats or use --no-normalize as a comparison.", file=sys.stderr)
+            print(f"WARNING: normalized features reach |x|={peak:.3g}; some dimension has ~0 train std (loader std "
+                  f"floor 1e-6). Consider --std-floor 1e-2, or --no-normalize as a comparison.", file=sys.stderr)
     m = cache.manifest
     prov = {"cache_root": str(cfg.cache), "cache_version": m.get("cache_version"), "checkpoint": m.get("checkpoint"),
             "layer_names": [names[l] for l in cfg.layers] if names else None,
             "split_label": "single fixed split (SAFE seed-0 unseen tasks)",
-            "horizons": {"train": cfg.train_horizon, "seen_val": cfg.horizon}}
+            "horizons": {"train": cfg.train_horizon, "seen_val": cfg.horizon},
+            "memory_estimate_gb": round(est["total_gb"], 2), "std_floor": cfg.std_floor}
     return out, prov
 
 
@@ -476,10 +567,30 @@ def _is_previous_run(path: Path) -> bool:
     return True
 
 
-def _prepare_output(path: Path, overwrite: bool) -> None:
+RESUME_IGNORED = ("overwrite", "resume", "output_dir", "seeds", "save_checkpoints", "bootstrap", "ci",
+                  "latency_device", "memory_check")
+
+
+def _same_run(path: Path, cfg: RunConfig) -> bool:
+    try:
+        old = json.loads((path / "config.json").read_text())["config"]
+    except (OSError, ValueError, KeyError):
+        return False
+    new = asdict(cfg)
+    return all(old.get(k) == v for k, v in new.items() if k not in RESUME_IGNORED)
+
+
+def _prepare_output(path: Path, overwrite: bool, cfg: RunConfig | None = None) -> bool:
+    """Returns True when an earlier identical run is being resumed (its finished seeds are kept)."""
     path = path.expanduser()
     if path.is_symlink() or (path.exists() and not path.is_dir()):
         raise FileExistsError(f"{path} is a file or symlink, not an output folder")
+    if cfg is not None and cfg.resume and path.exists() and any(path.iterdir()):
+        if not _is_previous_run(path.resolve()):
+            raise FileExistsError(f"cannot resume {path}: it was not written by this runner")
+        if not _same_run(path, cfg):
+            raise FileExistsError(f"cannot resume {path}: it was run with a different configuration")
+        return True
     if path.exists() and any(path.iterdir()):
         if not overwrite:
             raise FileExistsError(f"{path} exists and is not empty; pass overwrite=True (--overwrite) to replace it")
@@ -491,28 +602,158 @@ def _prepare_output(path: Path, overwrite: bool) -> None:
         import shutil
         shutil.rmtree(resolved)
     path.mkdir(parents=True, exist_ok=True)
+    return False
 
 
 @torch.no_grad()
-def measure_latency(model, records, max_episodes: int = 20, warmup: int = 2) -> dict:
+def measure_latency(model, records, max_episodes: int = 20, warmup: int = 2, device: str = "cpu") -> dict:
     """Detector latency in ms per timestep: one seen_val episode at a time (batch 1) on the current device/threads.
 
     Covers the fusion detector only (features already extracted), i.e. what it adds on top of the VLA forward pass.
     Median over up to `max_episodes` episodes of (forward time / episode steps)."""
-    model.eval()
     recs = list(records)[:max_episodes]
     if not recs:
         return {"ms_per_step": math.nan, "n_episodes": 0}
+    dev = torch.device(device)
+    m = model if dev.type == "cpu" else copy.deepcopy(model).to(dev)
+    m.eval()
+    sync = torch.cuda.synchronize if dev.type == "cuda" else (lambda: None)
+
+    def to_dev(b):
+        return {k: v.to(dev) if isinstance(v, torch.Tensor) else v for k, v in b.items()}
     for r in recs[:warmup]:
-        model(collate_records([r]))
+        m(to_dev(collate_records([r])))
     per_step = []
     for r in recs:
-        batch = collate_records([r])
+        batch = to_dev(collate_records([r]))
+        sync()
         t0 = time.perf_counter()
-        model(batch)
+        m(batch)
+        sync()
         per_step.append((time.perf_counter() - t0) * 1e3 / max(int(batch["mask"].sum()), 1))
-    return {"ms_per_step": float(np.median(per_step)), "n_episodes": len(recs), "device": "cpu",
+    return {"ms_per_step": float(np.median(per_step)), "n_episodes": len(recs), "device": dev.type,
             "threads": torch.get_num_threads(), "definition": "median detector forward time per timestep, batch 1"}
+
+
+# ----------------------------------------------------------------------------------------------- bootstrap CIs
+
+STEP_SCORES = "seen_val_step_scores.npz"  # same layout as the depth sweep's rows/*.scores.npz
+
+
+def save_step_scores(path: Path, rows: list[dict]) -> None:
+    lengths = np.array([len(r["_step_logits"]) for r in rows], dtype=np.int64)
+    fd, tmp = tempfile.mkstemp(prefix=path.name, suffix=".npz", dir=path.parent)
+    os.close(fd)
+    np.savez(tmp, step_scores=np.concatenate([np.asarray(r["_step_logits"], np.float32) for r in rows]),
+             offsets=np.concatenate([[0], np.cumsum(lengths)]),
+             labels=np.array([r["failure"] for r in rows], np.float32), horizons=lengths,
+             task_ids=np.array([-1 if r["task_id"] is None else r["task_id"] for r in rows], np.int64),
+             trajectory_ids=np.array([r["trajectory_id"] for r in rows], dtype=str))
+    os.replace(tmp, path)
+
+
+def load_step_scores(path: Path) -> EvalInput:
+    """A fusion run's seed<s>/seen_val_step_scores.npz or a depth-sweep rows/L<l>_seed<s>.scores.npz."""
+    with np.load(path) as z:
+        flat, off = z["step_scores"], z["offsets"]
+        return EvalInput([flat[off[i]:off[i + 1]] for i in range(len(off) - 1)], z["labels"].astype(np.int64),
+                         z["horizons"].astype(np.int64), z["task_ids"], [str(t) for t in z["trajectory_ids"]])
+
+
+def align(inputs: list[EvalInput], ref_ids: list[str] | None = None) -> list[EvalInput]:
+    """Put every EvalInput in the same episode order; they must cover exactly the same episodes."""
+    ref = list(ref_ids if ref_ids is not None else inputs[0].trajectory_ids)
+    out = []
+    for d in inputs:
+        pos = {t: i for i, t in enumerate(d.trajectory_ids)}
+        if set(pos) != set(ref) or len(pos) != len(d.trajectory_ids):
+            raise ValueError("score files cover different (or duplicated) seen_val episodes")
+        o = [pos[t] for t in ref]
+        out.append(EvalInput([d.step_scores[i] for i in o], np.asarray(d.labels)[o], np.asarray(d.horizons)[o],
+                             np.asarray(d.task_ids)[o], ref))
+    if any(not np.array_equal(out[0].labels, d.labels) for d in out):
+        raise ValueError("score files disagree on episode labels")
+    return out
+
+
+class Scorer:
+    """Metrics of one EvalInput on a subset of its episodes: the plugged-in evaluator, or the built-in scorer
+    (episode score = cfg.aggregation of the step scores over each episode's horizon, then episode_metrics)."""
+
+    def __init__(self, evaluator=None, how: str = "max"):
+        self.evaluator, self.how = evaluator, how
+
+    def prepare(self, d: EvalInput):
+        if self.evaluator is not None:
+            return d
+        return np.array([aggregate(torch.as_tensor(np.asarray(s[:h], np.float64)), self.how)
+                         for s, h in zip(d.step_scores, d.horizons)])
+
+    def __call__(self, d: EvalInput, prepared, idx: np.ndarray) -> dict:
+        if self.evaluator is None:
+            m = episode_metrics(np.asarray(d.labels)[idx], prepared[idx])
+            return {k: v for k, v in m.items() if k not in ("n_episodes", "n_failures")}
+        sub = EvalInput([d.step_scores[i] for i in idx], np.asarray(d.labels)[idx], np.asarray(d.horizons)[idx],
+                        np.asarray(d.task_ids)[idx], [d.trajectory_ids[i] for i in idx])
+        return {k: float(v) for k, v in self.evaluator(sub).items()}
+
+
+def stratified_indices(labels, n: int, seed: int):
+    """n resamples of episode indices with replacement, separately among failures and successes (the depth sweep's
+    scheme: class counts are kept, so every metric stays defined)."""
+    labels = np.asarray(labels)
+    pos, neg = np.flatnonzero(labels == 1), np.flatnonzero(labels != 1)
+    rng = np.random.default_rng(seed)
+    for _ in range(n):
+        yield np.concatenate([rng.choice(pos, len(pos)), rng.choice(neg, len(neg))])
+
+
+def bootstrap_ci(inputs: list[EvalInput], scorer: Scorer, n: int = 1000, ci: float = 0.95, seed: int = 0) -> dict:
+    """Percentile CI of the seed-averaged metrics, resampling seen_val episodes (the same episodes for every seed)."""
+    inputs = align(inputs)
+    prepared = [scorer.prepare(d) for d in inputs]
+    samples: dict[str, list[float]] = {}
+    for idx in stratified_indices(inputs[0].labels, n, seed):
+        per_seed = [scorer(d, p, idx) for d, p in zip(inputs, prepared)]
+        for k in per_seed[0]:
+            samples.setdefault(k, []).append(float(np.nanmean([m[k] for m in per_seed])))
+    lo, hi = 100 * (1 - ci) / 2, 100 * (1 + ci) / 2
+    out = {}
+    for k, v in samples.items():
+        v = np.asarray(v)
+        v = v[np.isfinite(v)]
+        out[k] = [float(np.percentile(v, lo)), float(np.percentile(v, hi))] if len(v) else [math.nan, math.nan]
+    return {"ci": ci, "n_resamples": n, "seed": seed, "intervals": out,
+            "scheme": "stratified by outcome, same episodes for every seed, percentile CI of the seed mean"}
+
+
+def add_bootstrap(run_dir: Path, n: int, ci: float = 0.95, seed: int = 0) -> dict:
+    """(Re)compute the CI of a finished run from its saved step scores; updates summary.json and sheet_row.csv."""
+    run_dir = Path(run_dir)
+    conf = json.loads((run_dir / "config.json").read_text())
+    summary = json.loads((run_dir / "summary.json").read_text())
+    seeds = summary["seeds"]
+    inputs = [load_step_scores(run_dir / f"seed{s}" / STEP_SCORES) for s in seeds]
+    scorer = Scorer(resolve_evaluator(conf["config"].get("evaluator")), conf["config"].get("aggregation", "max"))
+    boot = bootstrap_ci(inputs, scorer, n, ci, seed)
+    for k, (lo, hi) in boot["intervals"].items():
+        if k in summary["metrics"]:
+            summary["metrics"][k]["ci"] = [lo, hi]
+    summary["bootstrap"] = {k: v for k, v in boot.items() if k != "intervals"}
+    summary["sheet_row"] = _with_ci_notes(summary["sheet_row"], boot)
+    _write_json(run_dir / "summary.json", summary)
+    _write_sheet_csv(run_dir / "sheet_row.csv", [summary["sheet_row"]])
+    return summary
+
+
+def _with_ci_notes(row: dict, boot: dict) -> dict:
+    row = dict(row)
+    pct = int(round(100 * boot["ci"]))
+    parts = [f"{key} {pct}% CI [{100 * boot['intervals'][key][0]:.2f}, {100 * boot['intervals'][key][1]:.2f}]"
+             for key, _ in SHEET_METRICS if key in boot["intervals"]]
+    notes = [p for p in str(row.get("Notes", "")).split("; ") if p and " CI [" not in p]
+    row["Notes"] = "; ".join(notes + parts)
+    return row
 
 
 SHEET_METRICS = (("roc_auc", "Seen Val ROC-AUC (%)"), ("pr_auc", "Seen Val PR-AUC (%)"),
@@ -567,23 +808,34 @@ def run(cfg: RunConfig, splits: dict[str, list[dict]] | None = None, provenance:
     validate_config(cfg, need_source=splits is None)
     evaluator = resolve_evaluator(cfg.evaluator)  # fail before any data is read
     provisional = provisional_flags(evaluator)
-    if splits is None:
-        splits, prov = load_synthetic_splits(cfg) if cfg.synthetic else load_cache_splits(cfg)
-    else:
-        prov = provenance or {"source": "records passed by caller"}
-    d = check_splits(splits, len(cfg.layers))
     out = Path(cfg.output_dir)
-    _prepare_output(out, cfg.overwrite)
+    resuming = _prepare_output(out, cfg.overwrite, cfg)
+    done = {s for s in cfg.seeds if resuming and (out / f"seed{s}" / "metrics.json").is_file()
+            and (out / f"seed{s}" / STEP_SCORES).is_file()}
+    if resuming:
+        print(f"resume {out}: seeds {sorted(done)} already finished", file=sys.stderr)
+    if done == set(cfg.seeds):  # nothing to train: no data needed
+        run_info = json.loads((out / "config.json").read_text())
+        prov, d = run_info["provenance"], run_info["feature_dim"]
+    else:
+        if splits is None:
+            splits, prov = load_synthetic_splits(cfg) if cfg.synthetic else load_cache_splits(cfg)
+        else:
+            prov = provenance or {"source": "records passed by caller"}
+        d = check_splits(splits, len(cfg.layers))
+        run_info = {"marker": RUN_MARKER, "config": asdict(cfg), "provenance": prov, "provisional": provisional,
+                    "evaluator": getattr(evaluator, "name", "builtin_" + cfg.aggregation),
+                    "git_commit": _git_commit(), "feature_dim": d,
+                    "n_episodes": {s: len(r) for s, r in splits.items()}, "synthetic": bool(cfg.synthetic)}
+        _write_json(out / "config.json", run_info)
     if cfg.horizon != "task_min_step":
         print("WARNING: horizon='full' lets episode length reveal the label; not reportable", file=sys.stderr)
-    run_info = {"marker": RUN_MARKER, "config": asdict(cfg), "provenance": prov, "provisional": provisional,
-                "evaluator": getattr(evaluator, "name", "builtin_" + cfg.aggregation), "git_commit": _git_commit(),
-                "feature_dim": d, "n_episodes": {s: len(r) for s, r in splits.items()},
-                "synthetic": bool(cfg.synthetic)}
-    _write_json(out / "config.json", run_info)
 
     per_seed = {}
     for seed in cfg.seeds:
+        if seed in done:
+            per_seed[seed] = json.loads((out / f"seed{seed}" / "metrics.json").read_text())
+            continue
         torch.manual_seed(seed)
         np.random.seed(seed)
         model = get_model(cfg.model, **model_kwargs(cfg, d))
@@ -597,13 +849,14 @@ def run(cfg: RunConfig, splits: dict[str, list[dict]] | None = None, provenance:
             "train": evaluate(episode_scores(model, splits["train"], cfg.batch_size, cfg.aggregation), evaluator),
             "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
             "layer_weights": model.layer_weights().tolist() if hasattr(model, "layer_weights") else None,
-            "latency": measure_latency(model, splits["seen_val"]),
+            "latency": measure_latency(model, splits["seen_val"], device=cfg.latency_device),
             **trained, "provisional": provisional, "synthetic": bool(cfg.synthetic),
         }
         seed_dir = out / f"seed{seed}"
         seed_dir.mkdir(parents=True, exist_ok=True)
         _write_json(seed_dir / "metrics.json", metrics)
         _write_scores_csv(seed_dir / "seen_val_episode_scores.csv", rows)
+        save_step_scores(seed_dir / STEP_SCORES, rows)
         if cfg.save_checkpoints:
             torch.save({"model": cfg.model, "model_kwargs": model_kwargs(cfg, d), "model_state": model.state_dict(),
                         "config": asdict(cfg), "seed": seed, "chosen_epoch": trained["chosen_epoch"]},
@@ -623,4 +876,10 @@ def run(cfg: RunConfig, splits: dict[str, list[dict]] | None = None, provenance:
     summary["sheet_row"] = sheet_row(summary["metrics"], per_seed, label)
     _write_json(out / "summary.json", summary)
     _write_sheet_csv(out / "sheet_row.csv", [summary["sheet_row"]])
+    if cfg.bootstrap:
+        summary = add_bootstrap(out, cfg.bootstrap, cfg.ci)
+        ci = summary["metrics"]["roc_auc"].get("ci")
+        if ci:
+            print(f"[{label}] seen_val ROC-AUC {100 * summary['metrics']['roc_auc']['mean']:.2f}% "
+                  f"({int(round(100 * cfg.ci))}% CI {100 * ci[0]:.2f}-{100 * ci[1]:.2f})", flush=True)
     return summary

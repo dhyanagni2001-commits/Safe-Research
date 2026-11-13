@@ -11,7 +11,26 @@
 - **Static learned weights** (`failure_prob/models/static_weight_fusion.py`) compute `gamma · Σ_k softmax(α)_k · P_k(x_k)`. Each layer first goes through its own `Linear(D, 64)` into a shared 64-d space ("project features to shared dimension"). The weights are one scalar per layer, the same for every timestep and episode. With `proj_dim = hidden_dim = 64`, F3 has about the same number of parameters as concatenating the same layers (K·4096·64), so F3 vs F2 is a parameter-matched comparison. Without `--proj-dim` it is a pure scalar mix of the z-scored layers, and `--fixed-weights` freezes the mix (uniform, the S6 reference).
 - **Probe heads:** both models take `head="mlp"` (default) or `"linear"` (`failure_prob/models/probe_heads.py`). Once B6 fixes the probe, pass its head, width and budget as flags.
 
-## Run (CARC, CPU node)
+## Run on CARC (Slurm, CPU)
+
+`scripts/carc/fusion.slurm` wraps every command below. It defaults to 8 CPUs, 32G and 4 h; override with `sbatch --mem=... --time=...`.
+
+```bash
+cd Safe-Research && mkdir -p logs            # Slurm writes logs/fusion-<job>.out (git-ignored)
+export CACHE=<shared cache v1/ folder>
+sbatch scripts/carc/fusion.slurm a9 --cache "$CACHE" --out "$TMPDIR/a9_fs" --layers 33        # A9 done-check
+sbatch scripts/carc/fusion.slurm search --model concat_fusion --layers A B --cache "$CACHE" \
+       --output-dir outputs/fusion/F1 --label "F1 two-layer concat"
+sbatch scripts/carc/fusion.slurm kcurve --model concat_fusion --layers A B C D --reference-layer R \
+       --cache "$CACHE" --output-dir outputs/fusion/F6
+sacct -j <job id> --format=JobID,Elapsed,MaxRSS,State                                      # measured time/memory
+```
+
+- **Out of time or cancelled:** resubmit the same command with `--resume`. Finished seeds and grid points are kept, and a folder whose configuration differs is refused.
+- **Memory:** the runner prints its memory estimate before loading and stops if the estimate exceeds 90% of the job's `--mem` (`--no-memory-check` skips this).
+- **Disk reads:** layer files are read in one sequential pass each. Memory-mapped random reads stalled on `/scratch1` under load in the depth sweep.
+
+The same commands without Slurm:
 
 ```bash
 # CACHE = the shared cache v1/ folder (team handoff); only train + seen_val files are read
@@ -21,9 +40,13 @@ python scripts/fusion_experiments.py search --model concat_fusion --layers A B C
     --output-dir outputs/fusion/F2 --label "F2 three-layer concat"
 python scripts/fusion_experiments.py search --model static_weight_fusion --proj-dim 64 --layers A B C --cache "$CACHE" \
     --output-dir outputs/fusion/F3 --label "F3 static learned weights"
-# F6: --layers is the RANKED selection (best first); pass the winner's searched hyper-parameters
+# F6: --layers is the RANKED selection (best first); pass the winner's searched hyper-parameters.
+# --reference-layer = R1's best single layer, also run as K=1 when it is not the first ranked layer
 python scripts/fusion_experiments.py kcurve --model concat_fusion --layers A B C D --lr 3e-4 --dropout 0.2 \
-    --cache "$CACHE" --output-dir outputs/fusion/F6 --label "F6 K ablation"
+    --reference-layer R --cache "$CACHE" --output-dir outputs/fusion/F6 --label "F6 K ablation"
+# Is the gain real? Paired bootstrap CI of the difference, against the depth sweep's single layer or another run
+python scripts/fusion_compare.py --a outputs/fusion/F1/hp_<winner> --b "<sweep out>/rows/L16_seed*.scores.npz" \
+    --label-a "F1" --label-b "best single L16" --out outputs/fusion/F1/vs_L16.json
 # a single configuration (no search)
 python scripts/run_fusion.py --model static_weight_fusion --proj-dim 64 --layers A B C --cache "$CACHE" \
     --output-dir outputs/fusion/one_run
@@ -47,6 +70,18 @@ Until S1–S3 pick the layers, any layers run, but the numbers are development n
 - The cache is read once for the whole grid (and once for the whole K curve).
 - Selection and reporting both use seen_val, so the winner's numbers are optimistic. `search.csv` keeps every grid point, and the sheet row says so in Notes.
 
+**Confidence intervals:**
+- Every run reports 95% bootstrap CIs over seen_val episodes (`--bootstrap 1000 --ci 0.95`). The scheme is the depth sweep's: resample stratified by outcome, use the same episodes for every seed, and take the percentile interval of the seed mean.
+- `search` computes the CI only for the winning grid point.
+- Per-step scores are saved as `seed<s>/seen_val_step_scores.npz`, in the same layout as the sweep's `rows/*.scores.npz`.
+- `scripts/fusion_compare.py` scores both sides with one evaluator on the same resampled episodes. It reports the difference in points with its CI and the share of resamples where A is not better. Use it before claiming that fusion beats a single layer, or that F3 beats F2.
+
+**Normalization floor:**
+- The loader floors the train std at 1e-6, so a dimension that is constant on train can blow up to around 1e6 on seen_val. The runner warns when that happens.
+- `--std-floor 1e-2` normalizes with `max(std, 1e-2)` instead. Use the same setting on both sides of a comparison.
+
+**Latency:** `--latency-device cuda` measures on a GPU when one is visible. The Slurm job is CPU-only.
+
 **Shared evaluator (B4):** pass `--evaluator package.module:factory`, or a name registered in the depth sweep's `sweep_plugins.EVALUATORS` (PR #4, e.g. `temporary_max`). The contract is the sweep's: `Evaluator(EvalInput) -> dict`. The evaluator gets per-step scores (logits) of every seen_val episode, already cut to `task_min_step`. Once a non-TEMPORARY evaluator is used, the `episode_scorer` provisional flag disappears from every output.
 
 ## Output
@@ -58,19 +93,22 @@ In `--output-dir` of one run:
   - train metrics (a fit check at the train horizon, not comparable with seen_val);
   - learning curve, chosen epoch, trainable parameters, latency, and F3's learned layer weights.
 - `seed<s>/seen_val_episode_scores.csv`: one row per episode (`trajectory_id, task_id, failure, n_steps, score, prob`), the input for bootstrap CIs. `score` is in logit space and is what the AUCs rank. `prob` is for reading only (probabilities saturate at 1.0).
+- `seed<s>/seen_val_step_scores.npz`: per-step scores for bootstrap CIs and `fusion_compare.py`.
 - `seed<s>/model.pt`: the checkpoint.
-- `summary.json`: mean and std over seeds.
+- `summary.json`: mean, std and bootstrap CI over seeds.
 - `sheet_row.csv`: one row in the experiments sheet's columns.
-  - Seen Val ROC-AUC / PR-AUC / TPR @ 5% FPR, in **percent (0–100)**, mean over seeds, with the std in Notes.
+  - Seen Val ROC-AUC / PR-AUC / TPR @ 5% FPR, in **percent (0–100)**, mean over seeds. Notes holds the std and the 95% CI.
   - **Parameters** (trainable).
   - **Latency (ms)**: median detector forward time per timestep at batch 1 on the CPU it ran on. Features are assumed already extracted, so this is what fusion adds on top of the VLA.
   - The unseen-test columns stay empty until N3.
 
-`search` adds `search.csv`, `best.json` and `sheet_rows.csv`, plus one `hp_<grid point>/` run per grid point. `kcurve` adds `K<k>/` runs, `k_curve.csv` (with the change against K = 1 in points) and `sheet_rows.csv`.
+`search` adds `search.csv`, `best.json` and `sheet_rows.csv`, plus one `hp_<grid point>/` run per grid point. `kcurve` adds `K<k>/` runs (and `ref_L<l>/` with `--reference-layer`), `k_curve.csv` and `sheet_rows.csv`. `k_curve.csv` gives each K's change in points against K = 1 and against the best single layer.
 
 The runners refuse to overwrite a non-empty folder unless you pass `--overwrite`. Even then they only replace folders they wrote themselves (marker file), and never the current directory, your home folder or the repo.
 
-**Memory:** records are float32, about rows × K × 4096 × 4 bytes. Train at the full horizon is about 1.4 GB per layer, so run K ≥ 3 on a CARC CPU node, not a laptop.
+**Memory:** records are float32, about rows × K × 4096 × 4 bytes, plus one split's float16 layer files while they are read. Train at the full horizon is about 1.4 GB per layer. K ≤ 2 fits in 16G and K = 3–4 needs about 32G; the runner's estimate is printed in every log.
+
+**Tested environments:** the suite passes with the CARC kit's versions (Python 3.10, torch 2.2.0, numpy 1.26.4, pandas 2.3.3, scikit-learn 1.7.2) and with newer ones. It also passes with PR #4 (depth sweep) merged in.
 
 ## Guarantees and what is still provisional
 
