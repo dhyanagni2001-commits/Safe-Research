@@ -1,4 +1,4 @@
-# A9: review of the loader export (`collection/load_cache.py`, PR #3)
+# A9: review of the loader export (`collection/load_cache.py`, merged in PR #3)
 
 Reviewer: Dhyan. Scope: `SharedCache.records` and `load_cache.py export`. Checked: layer keys 0–33, train-only normalization, the unseen lock.
 Tests: `tests/test_a9_loader_export.py` (run with `python -m pytest -q tests/test_a9_loader_export.py`). Data: a synthetic 34-layer cache built by the real `build_cache.py`. Nothing in this review was run on the CARC cache.
@@ -7,7 +7,21 @@ Tests: `tests/test_a9_loader_export.py` (run with `python -m pytest -q tests/tes
 
 The loader reads the right data. Every layer key 0–33 returns its own layer for every pooling and both dev splits. Normalization uses train-only statistics, applied per requested layer in any order. The unseen lock holds for `records` and `export`.
 
-Three issues are still open, and A9-1 matters before anyone reports numbers from an export. Each one has a `xfail(strict=True)` test. When a fix lands, its test will XPASS and fail the run. Remove that test's marker at that point.
+The review found three issues. All three are now **fixed** in `collection/load_cache.py` on Dhyan's branch, and their tests run as normal tests. Two of the notes below are fixed too: unknown pools and missing `norm_stats` layers now give readable errors.
+
+**Done-check on the real cache** (the tracker's "real cache loads through FeatureStore"), run once on a CARC CPU node:
+
+```bash
+python scripts/a9_verify_export.py --cache $CACHE --out $TMPDIR/a9_fs --layers 33
+```
+
+It exports train and seen_val, loads them back through FeatureStore, and checks that:
+- the episode counts match `episodes.csv`;
+- every episode has `min(length, task_min_step)` steps;
+- the features are bit-identical to `records()`;
+- the metadata is right.
+
+It also prints the smallest train std per layer (see the std-floor note). It ends with `A9 PASS` or `A9 FAIL` and never touches `unseen_test`.
 
 ## Verified (passing tests)
 
@@ -24,26 +38,28 @@ Three issues are still open, and A9-1 matters before anyone reports numbers from
 | The `episodes.csv` split column equals `splits.json`, and no trajectory is in two splits. | `test_episodes_csv_agrees_with_splits_json` |
 | `records(horizon="task_min_step")` cuts every episode to `task_min_step`. | `test_task_min_step_horizon_in_records` |
 
-## Open findings
+## Findings (all fixed)
 
-**A9-1 (high): `export` always writes full-length episodes.** `export()` calls `cache.records(...)` without `horizon`, so it gets the default `"full"`, and the CLI has no `--horizon` option. Failures always run to 520 steps, so any model trained or scored on an export can read the label from episode length. The handoff gives the export command as an alternative to `records(..., horizon="task_min_step")`, which makes this easy to hit. The metadata does not record the horizon either, so nobody can tell afterwards.
-Suggested fix: add `--horizon {task_min_step,full}` (default `task_min_step`), pass it through to `records`, and record it in the metadata, e.g. `pooling=f"{pool}{'+trainnorm' if normalize else ''}+h={horizon}"`, the same way normalization is recorded.
-Test: `test_export_can_write_task_min_step_horizon`.
+Behaviour change for anyone scripting the export: `export` now writes `task_min_step` episodes by default. Pass `--horizon full` for whole rollouts; it prints a leakage warning. The metadata `pooling` string now ends in `+h=<horizon>`, e.g. `mean+trainnorm+h=task_min_step`. Nothing in the repo parses that string.
 
-**A9-2 (medium): unknown horizons are accepted silently.** `stop = ep.row_end if horizon == "full" else ...` treats any other string as `task_min_step`. A typo like `"task-min-step"` happens to do the right thing, but `"min"` or `"full "` with a trailing space also run without an error.
-Suggested fix: `if horizon not in ("full", "task_min_step"): raise ValueError(...)`.
+**A9-1 (high, fixed): `export` always wrote full-length episodes.** `export()` calls `cache.records(...)` without `horizon`, so it gets the default `"full"`, and the CLI has no `--horizon` option. Failures always run to 520 steps, so any model trained or scored on an export can read the label from episode length. The handoff gives the export command as an alternative to `records(..., horizon="task_min_step")`, which makes this easy to hit. The metadata does not record the horizon either, so nobody can tell afterwards.
+Fix: `--horizon {task_min_step,full}` (default `task_min_step`), passed through to `records` and recorded in the metadata.
+Tests: `test_export_can_write_task_min_step_horizon`, `test_export_default_is_task_min_step_and_full_is_labelled`.
+
+**A9-2 (medium, fixed): unknown horizons were accepted silently.** `stop = ep.row_end if horizon == "full" else ...` treats any other string as `task_min_step`. A typo like `"task-min-step"` happens to do the right thing, but `"min"` or `"full "` with a trailing space also run without an error.
+Fix: `records` raises `ValueError` for anything but `"full"` or `"task_min_step"`.
 Test: `test_unknown_horizon_refused`.
 
-**A9-3 (low): duplicate layer keys are accepted.** `records(layers=[33, 33])` returns K=2 copies of the same layer, and export would write `layers=(33, 33)`. A fusion model would then train on a duplicated layer without any error.
-Suggested fix: refuse duplicates next to the existing range check.
+**A9-3 (low, fixed): duplicate layer keys were accepted.** `records(layers=[33, 33])` returns K=2 copies of the same layer, and export would write `layers=(33, 33)`. A fusion model would then train on a duplicated layer without any error.
+Fix: duplicates are refused next to the range check. The export CLI exits with `error: duplicate layers ...`.
 Test: `test_duplicate_layers_refused`.
 
 ## Notes (no change needed, worth knowing)
 
 - **Normalization statistics cover the full horizon.** They are computed over full-length train episodes, while results use `task_min_step`. That is fine: it is still train-only and the same for every model. It just means normalized train features at the reporting horizon are not exactly mean 0.
-- **The `std` floor is 1e-6, and this does happen.** A dimension that is constant on train but varies on seen_val gets scaled by about 1e6. In the synthetic fixture, layer 16 has dimensions whose values round to the same bf16 number on every train row (std = 0), and normalized seen_val values reach 2,000,000. Before the real sweep, check `min(std)` per layer in `norm_stats/*.npz` on the real cache. A larger floor, e.g. `max(std, 1e-3 * median(std))`, would be safer. `fusion_runner` prints a warning when normalized features exceed |x| > 1e3.
-- **Missing layers in `norm_stats`.** If a cache was built with `--layers` (a subset), `norm_stats()` raises a bare `KeyError` for a missing layer instead of a readable message.
-- **Pool names and case.** On macOS (case-insensitive file system), `pool="Mean"` silently reads `mean/`. On CARC (Linux) it raises `FileNotFoundError`. Validating `pool` against `manifest["pools_exported"]` would make this the same everywhere.
+- **The `std` floor is 1e-6, and this does happen (not changed: a data decision for B5/Rhea).** A dimension that is constant on train but varies on seen_val gets scaled by about 1e6. In the synthetic fixture, layer 16 has dimensions whose values round to the same bf16 number on every train row (std = 0), and normalized seen_val values reach 2,000,000. Before the real sweep, check `min(std)` per layer in `norm_stats/*.npz` on the real cache. A larger floor, e.g. `max(std, 1e-3 * median(std))`, would be safer. `fusion_runner` prints a warning when normalized features exceed |x| > 1e3.
+- **Missing layers in `norm_stats` (fixed).** If a cache was built with a `--layers` subset, `norm_stats()` now names the missing layers and the ones it has, instead of a bare `KeyError`.
+- **Pool names and case (fixed).** `pool` is checked against `manifest["pools_exported"]`, so `pool="Mean"` fails the same way on macOS and on CARC.
 - **Memory.** `export` holds every record in memory as float32. That is about 1.4 GB per layer for train at full horizon, so a 4-layer export needs about 10 GB of RAM.
 
-`failure_prob/fusion_runner.py` (F3) does not depend on these fixes. It calls `records` directly, validates `horizon` and duplicate layers itself, and checks that every episode has exactly the expected number of steps.
+`failure_prob/fusion_runner.py` does not depend on these fixes. It calls `records` directly, validates `horizon` and duplicate layers itself, and checks that every episode has exactly the expected number of steps.

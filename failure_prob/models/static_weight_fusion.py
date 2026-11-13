@@ -1,12 +1,18 @@
-"""F2: static-weight layer fusion (scalar mix).
+"""F3 (experiment row 21): static learned layer weights (weighted sum + MLP).
 
-    fused[b, t] = gamma * sum_k softmax(alpha)_k * x[b, t, k]          x: [B, T, K, D]
+    z[b, t, k]   = P_k(x[b, t, k])            P_k = Linear(D, proj_dim) per layer, or identity when proj_dim is None
+    fused[b, t]  = gamma * sum_k softmax(alpha)_k * z[b, t, k]          x: [B, T, K, D]
     logits[b, t] = head(fused[b, t])
 
+``proj_dim`` projects every layer to a shared dimension first (the experiment sheet's "project features to shared
+dimension"): each layer gets its own Linear(D, proj_dim), so layers can be mixed in a learned common space. With
+proj_dim = hidden_dim and an mlp head, F3 has about the same parameter count as the concatenation of the same K
+layers (K * D * proj_dim), which makes "F3 vs concatenation" a parameter-matched comparison. Without projection
+(proj_dim=None) it is a pure scalar mix of the z-scored layers:
+
 The K layer weights are *static*: one scalar per layer, shared by every timestep, episode and task (unlike
-``gated_fusion``, whose weights depend on the input). The fused vector keeps the per-layer width D, so the head has
-exactly as many parameters as a single-layer probe; fusion only adds K (+1 for gamma) parameters. That makes it the
-parameter-matched counterpart of ``concat_fusion`` (F1), whose head grows with K.
+``gated_fusion``, whose weights depend on the input). Without projection the fused vector keeps the per-layer width
+D, so the head has exactly as many parameters as a single-layer probe and fusion only adds K (+1 for gamma).
 
 ``learn_weights=False`` freezes the mix at ``init_weights`` (uniform when omitted). The frozen weights live in a
 buffer, so they are saved with the checkpoint but are not trainable parameters. Use it for fixed-weight references
@@ -48,7 +54,7 @@ def _normalized_init(init_weights: Sequence[float] | None, num_layers: int, lear
 @register_model("static_weight_fusion")
 class StaticWeightFusion(FusionDetector):
     def __init__(self, input_dim=32, num_layers=2, hidden_dim=64, dropout=0.0, head="mlp", learn_weights=True,
-                 init_weights=None, learn_scale=True, **kwargs):
+                 init_weights=None, learn_scale=True, proj_dim=None, **kwargs):
         super().__init__(input_dim, num_layers, hidden_dim, dropout)
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {num_layers}")
@@ -62,8 +68,13 @@ class StaticWeightFusion(FusionDetector):
             self.gamma = nn.Parameter(torch.ones(()))
         else:
             self.register_buffer("gamma", torch.ones(()))
+        if proj_dim is not None and (isinstance(proj_dim, bool) or int(proj_dim) != proj_dim or proj_dim < 1):
+            raise ValueError(f"proj_dim must be a positive integer or None, got {proj_dim!r}")
+        self.proj_dim = None if proj_dim is None else int(proj_dim)
+        self.proj = (None if self.proj_dim is None
+                     else nn.ModuleList(nn.Linear(input_dim, self.proj_dim) for _ in range(num_layers)))
         self.head_kind = head
-        self.head = build_head(head, input_dim, hidden_dim, dropout)
+        self.head = build_head(head, self.proj_dim or input_dim, hidden_dim, dropout)
 
     def layer_weights(self) -> torch.Tensor:
         """Current mixing weights, shape [K], non-negative and summing to 1."""
@@ -75,13 +86,15 @@ class StaticWeightFusion(FusionDetector):
         x = self._layers(batch)
         check_layer_input(x, self.num_layers, self.input_dim)
         w = self.layer_weights().to(x.dtype)
+        if self.proj is not None:
+            x = torch.stack([p(x[:, :, k]) for k, p in enumerate(self.proj)], dim=2)  # [B, T, K, proj_dim]
         fused = self.gamma.to(x.dtype) * torch.einsum("btkd,k->btd", x, w)
         logits = self.head(self.dropout(fused))
         return Output(logits, auxiliary={"layer_weights": w.detach()})
 
     def extra_repr(self) -> str:
         return (f"num_layers={self.num_layers}, input_dim={self.input_dim}, head={self.head_kind!r}, "
-                f"learn_weights={self.learn_weights}")
+                f"learn_weights={self.learn_weights}, proj_dim={self.proj_dim}")
 
 
 def entropy_of(weights: torch.Tensor) -> float:

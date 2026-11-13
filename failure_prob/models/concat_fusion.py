@@ -1,8 +1,9 @@
-"""F1: concatenation fusion. The K chosen layers are concatenated per timestep ([B,T,K*D]) and probed.
+"""Concatenation fusion: F1 (row 19, two layers) and F2 (row 20, three layers). The K chosen layers are
+concatenated per timestep ([B,T,K*D]) and probed.
 
 ``head="mlp"`` (default, unchanged from the original model) or ``head="linear"`` (logistic probe) - see probe_heads.py.
-The head's input width grows with K, so compare it against ``static_weight_fusion`` (F2) and a parameter-matched
-single-layer probe before attributing a gain to fusion.
+The head's input width grows with K, so compare it against ``static_weight_fusion`` (F3) and a parameter-matched
+single-layer probe (K1/K2) before attributing a gain to fusion.
 """
 from ._fusion import FusionDetector
 from .base import Output

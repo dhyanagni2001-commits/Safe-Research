@@ -1,4 +1,4 @@
-"""F3: fusion runner on train/seen_val. Uses a tiny 34-layer cache built by the real build_cache.py (no GPU)."""
+"""Fusion runner (F1, F2, F3, F6) on train/seen_val. Uses a tiny 34-layer cache built by the real build_cache.py (no GPU)."""
 import json
 import math
 import subprocess
@@ -286,3 +286,117 @@ def test_summary_handles_nan_and_single_seed():
     assert s["roc_auc"]["mean"] == 0.7 and math.isnan(s["roc_auc"]["std"]) and s["roc_auc"]["n_seeds_defined"] == 1
     assert s["pr_auc"]["n_seeds_defined"] == 2
     assert s["pr_auc"]["std"] == pytest.approx(np.std([0.6, 0.5], ddof=1))
+
+
+# --------------------------------------------------------------------------- protocol shared with the depth sweep
+
+def test_train_full_horizon_seen_val_task_min_step_by_default(cache, monkeypatch, tmp_path):
+    got = {}
+    orig = FR.load_cache_splits
+
+    def spy(c):
+        splits, prov = orig(c)
+        got.update(splits)
+        return splits, prov
+    monkeypatch.setattr(FR, "load_cache_splits", spy)
+    FR.run(cfg(tmp_path / "r", cache=str(cache), seeds=[0], save_checkpoints=False))
+    eps = pd.read_csv(cache / "episodes.csv").set_index("trajectory_id")
+    for r in got["train"]:
+        assert r["features"].shape[1] == eps.loc[r["trajectory_ids"][0], "length"]
+    for r in got["seen_val"]:
+        ep = eps.loc[r["trajectory_ids"][0]]
+        assert r["features"].shape[1] == min(ep.length, ep.task_min_step)
+    conf = json.loads((tmp_path / "r" / "config.json").read_text())
+    assert conf["provenance"]["horizons"] == {"train": "full", "seen_val": "task_min_step"}
+    assert json.loads((tmp_path / "r" / "summary.json").read_text())["train_horizon"] == "full"
+
+
+def test_train_horizon_can_match_seen_val(cache, tmp_path):
+    s = FR.run(cfg(tmp_path / "r", cache=str(cache), seeds=[0], train_horizon="task_min_step",
+                   save_checkpoints=False))
+    assert s["train_horizon"] == "task_min_step"
+    with pytest.raises(ValueError, match="train_horizon"):
+        FR.validate_config(cfg(tmp_path / "x", synthetic=True, train_horizon="min"))
+
+
+# --------------------------------------------------------------------------- pluggable evaluator (B4)
+
+class RecordingEvaluator:
+    """Stands in for B4: same contract as the depth sweep's evaluators."""
+    name = "test_eval"
+    temporary = False
+    calls = []
+
+    def __call__(self, data):
+        RecordingEvaluator.calls.append(data)
+        scores = [float(np.max(s[:h])) for s, h in zip(data.step_scores, data.horizons)]
+        return FR.episode_metrics(data.labels, scores) | {"extra_metric": 1.0}
+
+
+def make_recording_evaluator():
+    return RecordingEvaluator()
+
+
+class NoAucEvaluator:
+    name, temporary = "no_auc", True
+
+    def __call__(self, data):
+        return {"something": 0.5}
+
+
+def test_plugged_in_evaluator_gets_eval_input_and_replaces_scorer(cache, tmp_path):
+    RecordingEvaluator.calls.clear()
+    out = tmp_path / "ev"
+    s = FR.run(cfg(out, cache=str(cache), seeds=[0], save_checkpoints=False,
+                   evaluator="test_fusion_runner:make_recording_evaluator"))
+    assert "episode_scorer" not in s["provisional"] and "probe" in s["provisional"]  # B6 still pending
+    assert s["evaluator"] == "test_eval" and "extra_metric" in s["metrics"]
+    eps = pd.read_csv(cache / "episodes.csv").set_index("trajectory_id")
+    n_val = int((eps.split == "seen_val").sum())
+    val_calls = [d for d in RecordingEvaluator.calls if len(d.labels) == n_val
+                 and set(eps.loc[d.trajectory_ids, "split"]) == {"seen_val"}]
+    assert len(val_calls) == 2 + 1  # one per epoch (learning curve) + the final seen_val score
+    data = val_calls[-1]
+    for sc, h, tid in zip(data.step_scores, data.horizons, data.trajectory_ids):
+        ep = eps.loc[tid]
+        assert len(sc) == h == min(ep.length, ep.task_min_step) and ep.split == "seen_val"
+    assert set(data.labels.tolist()) <= {0, 1} and len(data.task_ids) == len(data.labels)
+    m = json.loads((out / "seed0" / "metrics.json").read_text())
+    builtin = FR.run(cfg(tmp_path / "b", cache=str(cache), seeds=[0], save_checkpoints=False))
+    assert m["seen_val"]["roc_auc"] == pytest.approx(builtin["metrics"]["roc_auc"]["mean"])  # same model, same max
+
+
+@pytest.mark.parametrize("spec, msg", [("nope", "unknown evaluator"), ("no_such_module:f", "cannot load"),
+                                       ("test_fusion_runner:missing", "cannot load")])
+def test_bad_evaluator_spec_fails_before_loading(tmp_path, spec, msg):
+    with pytest.raises(ValueError, match=msg):
+        FR.run(cfg(tmp_path / "x", synthetic=True, seeds=[0], evaluator=spec))
+    assert not (tmp_path / "x").exists()
+
+
+def test_evaluator_without_roc_auc_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="roc_auc"):
+        FR.run(cfg(tmp_path / "x", synthetic=True, seeds=[0], epochs=1,
+                   evaluator="test_fusion_runner:NoAucEvaluator"))
+
+
+# --------------------------------------------------------------------------- sheet row: percent, parameters, latency
+
+def test_sheet_row_in_percent_with_parameters_and_latency(cache, tmp_path):
+    out = tmp_path / "sheet"
+    s = FR.run(cfg(out, cache=str(cache), seeds=[0, 1], save_checkpoints=False), label="F3 test")
+    row = s["sheet_row"]
+    assert row["Experiment"] == "F3 test"
+    assert row["Seen Val ROC-AUC (%)"] == pytest.approx(100 * s["metrics"]["roc_auc"]["mean"], abs=0.006)
+    assert 0 <= row["Seen Val ROC-AUC (%)"] <= 100 and row["Parameters"] > 0 and row["Latency (ms)"] > 0
+    assert "Unseen Test ROC-AUC (%)" not in row  # locked until N3
+    csv = pd.read_csv(out / "sheet_row.csv")
+    assert list(csv.columns) == FR.SHEET_COLUMNS and len(csv) == 1
+    FR.run(cfg(out, cache=str(cache), seeds=[0], save_checkpoints=False, overwrite=True))  # still our folder
+
+
+def test_proj_dim_reaches_the_model(cache, tmp_path):
+    out = tmp_path / "p"
+    FR.run(cfg(out, cache=str(cache), seeds=[0], proj_dim=8))
+    ck = torch.load(out / "seed0" / "model.pt", weights_only=False)
+    assert ck["model_kwargs"]["proj_dim"] == 8 and any(k.startswith("proj.") for k in ck["model_state"])

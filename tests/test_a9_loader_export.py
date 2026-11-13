@@ -84,7 +84,7 @@ def test_export_layer_keys_and_metadata(c34):
     meta = store.metadata()
     assert meta.layers == (0, 32, 33) and meta.num_layers == 34 and "33=block32_prenorm" in meta.layer_indexing
     assert meta.split_version == "v1:train" and meta.dtype == "float32"
-    recs = SharedCache(cache).records("train", layers=[33, 0])
+    recs = SharedCache(cache).records("train", layers=[33, 0], horizon="task_min_step")  # the export default
     got = store.load([33, 0])  # FeatureStore re-indexes by layer key, not by position
     assert all(torch.equal(g["features"], r["features"]) for g, r in zip(got, recs))
     with pytest.raises(ValueError):
@@ -128,8 +128,8 @@ def test_normalized_export_matches_records(c34):
     out = tmp / "fs_norm"
     assert export(cache, out, "--layers", 33, 4, "--normalize").returncode == 0
     store = FeatureStore(out / "seen_val")
-    assert store.metadata().pooling == "mean+trainnorm"
-    recs = SharedCache(cache).records("seen_val", layers=[33, 4], normalize=True)
+    assert store.metadata().pooling == "mean+trainnorm+h=task_min_step"
+    recs = SharedCache(cache).records("seen_val", layers=[33, 4], normalize=True, horizon="task_min_step")
     assert all(torch.equal(g["features"], r["features"]) for g, r in zip(store.load(), recs))
 
 
@@ -175,9 +175,8 @@ def test_task_min_step_horizon_in_records(c34):
     assert (eps.length > eps.task_min_step).any()  # fixture really has episodes that get cut
 
 
-# --------------------------------------------------------------------------- open findings
+# --------------------------------------------------------------------------- fixed findings (A9-1/2/3)
 
-@pytest.mark.xfail(strict=True, reason="A9-1: export has no horizon option and always writes full-length episodes")
 def test_export_can_write_task_min_step_horizon(c34):
     tmp, _, cache = c34
     out = tmp / "fs_horizon"
@@ -188,13 +187,46 @@ def test_export_can_write_task_min_step_horizon(c34):
         assert rec["features"].shape[1] == eps.loc[rec["trajectory_ids"][0], "task_min_step"]
 
 
-@pytest.mark.xfail(strict=True, reason="A9-2: any horizon other than 'full' is silently treated as task_min_step")
 def test_unknown_horizon_refused(c34):
     with pytest.raises(ValueError):
         SharedCache(c34[2]).records("train", layers=[33], horizon="task-min-step")
 
 
-@pytest.mark.xfail(strict=True, reason="A9-3: duplicate layer keys are accepted and duplicated in the features")
 def test_duplicate_layers_refused(c34):
     with pytest.raises(ValueError):
         SharedCache(c34[2]).records("train", layers=[33, 33])
+
+
+def test_export_default_is_task_min_step_and_full_is_labelled(c34):
+    tmp, _, cache = c34
+    eps = pd.read_csv(cache / "episodes.csv").set_index("trajectory_id")
+    r = export(cache, tmp / "fs_default", "--layers", 0)
+    assert r.returncode == 0, r.stderr
+    store = FeatureStore(tmp / "fs_default" / "train")
+    assert store.metadata().pooling == "mean+h=task_min_step"
+    for rec in store.load():
+        ep = eps.loc[rec["trajectory_ids"][0]]
+        assert rec["features"].shape[1] == min(ep.length, ep.task_min_step)
+    r = export(cache, tmp / "fs_full", "--layers", 0, "--horizon", "full")
+    assert r.returncode == 0 and "length reveals the label" in r.stderr
+    assert FeatureStore(tmp / "fs_full" / "train").metadata().pooling == "mean+h=full"
+
+
+def test_unknown_pool_and_missing_norm_stats_layer_are_readable(c34):
+    cache = SharedCache(c34[2])
+    with pytest.raises(ValueError, match="not in this cache"):
+        cache.records("train", layers=[0], pool="Mean")
+    with pytest.raises(ValueError, match="no statistics for layers"):
+        cache.norm_stats("mean", [0, 99])
+
+
+def test_a9_verify_script_passes_on_a_good_cache(c34):
+    tmp, _, cache = c34
+    script = KIT.parent / "scripts" / "a9_verify_export.py"
+    r = subprocess.run([sys.executable, str(script), "--cache", str(cache), "--out", str(tmp / "verify"),
+                        "--layers", "33", "0"], capture_output=True, text=True, env=ENV)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "A9 PASS" in r.stdout and not (tmp / "verify" / "unseen_test").exists()
+    r = subprocess.run([sys.executable, str(script), "--cache", str(cache), "--out", str(tmp / "verify")],
+                       capture_output=True, text=True, env=ENV)
+    assert r.returncode == 2 and "exists" in r.stderr  # never reuses / overwrites a folder

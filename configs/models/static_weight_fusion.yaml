@@ -5,3 +5,4 @@ dropout: 0.0
 learn_weights: true  # false = fixed mix at init_weights (uniform if null)
 init_weights: null
 learn_scale: true
+proj_dim: 64         # per-layer Linear(D, 64) to a shared dimension (row 21); null = pure scalar mix of z-scored layers

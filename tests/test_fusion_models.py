@@ -135,3 +135,36 @@ def test_state_dict_roundtrip(name, tmp_path):
     b = batch()
     m.eval(), m2.eval()
     assert torch.allclose(m(b).failure_logits, m2(b).failure_logits)
+
+
+# --------------------------------------------------------------------------- F3: projection to a shared dimension
+
+def test_projection_to_shared_dim_shapes_and_parameter_match_with_concat():
+    d, k, p = 48, 3, 16
+    m = get_model("static_weight_fusion", input_dim=d, num_layers=k, hidden_dim=p, proj_dim=p)
+    b = batch(k=k, d=d)
+    out = m(b)
+    assert out.failure_logits.shape == b["mask"].shape and torch.isfinite(out.failure_logits).all()
+    out.failure_logits.sum().backward()
+    assert all(lin.weight.grad is not None for lin in m.proj)
+    concat = get_model("concat_fusion", input_dim=d, num_layers=k, hidden_dim=p)
+    # projections K*(D*P+P) + head(P->P->1) vs concat head (K*D->P->1): equal up to the small P*P + K*P terms
+    assert abs(n_params(m) - n_params(concat)) <= p * p + k * p + k + 1
+    assert m.layer_weights().shape == (k,)
+
+
+def test_projection_layers_are_independent_per_layer():
+    m = get_model("static_weight_fusion", input_dim=8, num_layers=2, hidden_dim=4, proj_dim=4)
+    assert m.proj[0].weight.data_ptr() != m.proj[1].weight.data_ptr()
+
+
+@pytest.mark.parametrize("bad", [0, -3, 2.5, True])
+def test_bad_proj_dim(bad):
+    with pytest.raises(ValueError, match="proj_dim"):
+        get_model("static_weight_fusion", input_dim=8, num_layers=2, proj_dim=bad)
+
+
+def test_projection_with_fixed_uniform_weights_and_k1():
+    m = get_model("static_weight_fusion", input_dim=8, num_layers=1, hidden_dim=4, proj_dim=4, learn_weights=False)
+    b = batch(k=1, d=8)
+    assert m(b).failure_logits.shape == b["mask"].shape

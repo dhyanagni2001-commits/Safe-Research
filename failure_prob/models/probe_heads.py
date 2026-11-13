@@ -1,4 +1,4 @@
-"""Probe heads shared by the fusion detectors (F1-F3).
+"""Probe heads shared by the fusion detectors (F1, F2, F3, F6).
 
 The shared probe spec (B6) decides which head the team reports; until then both are available and every fusion
 model takes the same ``head`` argument so swapping the probe never touches the fusion code.

@@ -1,4 +1,4 @@
-"""F3 CLI: train a fusion detector on train, score seen_val per episode, for seeds 0/1/2.
+"""Fusion runner CLI (one configuration; F1-F3 searches and F6 are in fusion_experiments.py): train a fusion detector on train, score seen_val per episode, for seeds 0/1/2.
 
 Real cache (CARC; CACHE = the shared cache v1/ folder from the team handoff):
     python scripts/run_fusion.py --model static_weight_fusion --layers 16 33 \
@@ -24,8 +24,9 @@ from failure_prob.models.probe_heads import HEADS  # noqa: E402
 from failure_prob.protocol import TRAIN_SEEDS  # noqa: E402
 
 
-def parse(argv=None) -> RunConfig:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def common_parser() -> argparse.ArgumentParser:
+    """Every RunConfig flag; shared with scripts/fusion_experiments.py."""
+    p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--model", required=True, choices=list_models())
     p.add_argument("--layers", required=True, type=int, nargs="+", help="cache layer indices (0..33; use 33, not 32, "
                    "for raw block 32 in depth comparisons)")
@@ -36,25 +37,41 @@ def parse(argv=None) -> RunConfig:
     p.add_argument("--pool", default="mean", choices=["mean", "first", "last"])
     p.add_argument("--no-normalize", dest="normalize", action="store_false",
                    help="use raw features (sensitivity check only; default z-scores with train-only stats)")
-    p.add_argument("--horizon", default="task_min_step", choices=HORIZONS)
+    p.add_argument("--horizon", default="task_min_step", choices=HORIZONS, help="seen_val scoring horizon")
+    p.add_argument("--train-horizon", default="full", choices=HORIZONS,
+                   help="train episodes (default full, as the depth sweep)")
     p.add_argument("--seeds", type=int, nargs="+", default=list(TRAIN_SEEDS))
     p.add_argument("--head", default="mlp", choices=HEADS)
     p.add_argument("--hidden-dim", type=int, default=64)
     p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=0.0)
     p.add_argument("--select-best-epoch", action="store_true", help="keep the epoch with the best seen_val ROC-AUC")
     p.add_argument("--aggregation", default="max", choices=AGGREGATIONS, help="episode score from step logits")
+    p.add_argument("--evaluator", default=None, help="shared evaluator (B4): a depth-sweep registered name or "
+                   "'package.module:factory'; default: the built-in provisional scorer")
     p.add_argument("--fixed-weights", dest="learn_weights", action="store_false",
                    help="static_weight_fusion: freeze the mix at --init-weights (uniform if omitted)")
     p.add_argument("--init-weights", type=float, nargs="+", help="static_weight_fusion: one value per layer")
+    p.add_argument("--proj-dim", type=int, default=None, help="static_weight_fusion: project every layer to this "
+                   "shared dimension before the weighted sum (F3 uses 64); omit for a pure scalar mix")
     p.add_argument("--overwrite", action="store_true", help="replace a non-empty --output-dir")
     p.add_argument("--no-checkpoints", dest="save_checkpoints", action="store_false")
-    a = p.parse_args(argv)
-    return RunConfig(**vars(a))
+    return p
+
+
+def to_config(ns: argparse.Namespace) -> RunConfig:
+    fields = set(RunConfig.__dataclass_fields__)
+    return RunConfig(**{k: v for k, v in vars(ns).items() if k in fields})
+
+
+def parse(argv=None) -> RunConfig:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                parents=[common_parser()])
+    return to_config(p.parse_args(argv))
 
 
 def main(argv=None) -> int:
