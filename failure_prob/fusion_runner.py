@@ -606,33 +606,53 @@ def _prepare_output(path: Path, overwrite: bool, cfg: RunConfig | None = None) -
 
 
 @torch.no_grad()
-def measure_latency(model, records, max_episodes: int = 20, warmup: int = 2, device: str = "cpu") -> dict:
-    """Detector latency in ms per timestep: one seen_val episode at a time (batch 1) on the current device/threads.
+def measure_latency(model, records, max_episodes: int = 20, steps_per_episode: int = 25, warmup: int = 5,
+                    device: str = "cpu") -> dict:
+    """Detector latency in ms per timestep, measured the way a deployed monitor runs: ONE call per timestep (batch 1,
+    a single step [1, 1, K, D]), no autograd, on the current device/threads. The fusion models score each step on its
+    own, so a one-step call is exactly the online cost. Covers the detector only (features already extracted), i.e.
+    what it adds on top of the VLA forward pass.
 
-    Covers the fusion detector only (features already extracted), i.e. what it adds on top of the VLA forward pass.
-    Median over up to `max_episodes` episodes of (forward time / episode steps)."""
+    ms_per_step: median over up to `steps_per_episode` evenly spaced steps of up to `max_episodes` seen_val episodes.
+    ms_per_step_amortized: whole-episode forward / steps (offline scoring; much smaller, not the online cost)."""
     recs = list(records)[:max_episodes]
     if not recs:
         return {"ms_per_step": math.nan, "n_episodes": 0}
     dev = torch.device(device)
     m = model if dev.type == "cpu" else copy.deepcopy(model).to(dev)
+    was_training = m.training
     m.eval()
     sync = torch.cuda.synchronize if dev.type == "cuda" else (lambda: None)
 
     def to_dev(b):
         return {k: v.to(dev) if isinstance(v, torch.Tensor) else v for k, v in b.items()}
-    for r in recs[:warmup]:
-        m(to_dev(collate_records([r])))
-    per_step = []
-    for r in recs:
-        batch = to_dev(collate_records([r]))
+
+    def one_step(r, t):
+        return to_dev(collate_records([{**r, "features": r["features"][:, t:t + 1], "mask": r["mask"][:, t:t + 1]}]))
+
+    def timed(batch) -> float:
         sync()
         t0 = time.perf_counter()
         m(batch)
         sync()
-        per_step.append((time.perf_counter() - t0) * 1e3 / max(int(batch["mask"].sum()), 1))
-    return {"ms_per_step": float(np.median(per_step)), "n_episodes": len(recs), "device": dev.type,
-            "threads": torch.get_num_threads(), "definition": "median detector forward time per timestep, batch 1"}
+        return (time.perf_counter() - t0) * 1e3
+
+    online, amortized = [], []
+    with torch.inference_mode():
+        for _ in range(warmup):
+            m(one_step(recs[0], 0))
+        for r in recs:
+            n = int(r["mask"].sum())
+            if n < 1:
+                continue
+            for t in np.unique(np.linspace(0, n - 1, min(steps_per_episode, n)).astype(int)):
+                online.append(timed(one_step(r, int(t))))
+            amortized.append(timed(to_dev(collate_records([r]))) / n)
+    m.train(was_training)
+    return {"ms_per_step": float(np.median(online)) if online else math.nan,
+            "ms_per_step_amortized": float(np.median(amortized)) if amortized else math.nan,
+            "n_episodes": len(recs), "n_calls": len(online), "device": dev.type, "threads": torch.get_num_threads(),
+            "definition": "median detector forward time for one timestep, one call per step (online), batch 1"}
 
 
 # ----------------------------------------------------------------------------------------------- bootstrap CIs

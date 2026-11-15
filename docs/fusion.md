@@ -117,7 +117,7 @@ In `--output-dir` of one run:
 - `sheet_row.csv`: one row in the experiments sheet's columns.
   - Seen Val ROC-AUC / PR-AUC / TPR @ 5% FPR, in **percent (0–100)**, mean over seeds. Notes holds the std and the 95% CI.
   - **Parameters** (trainable).
-  - **Latency (ms)**: median detector forward time per timestep at batch 1 on the CPU it ran on. Features are assumed already extracted, so this is what fusion adds on top of the VLA.
+  - **Latency (ms)**: median time of one detector call on ONE timestep (batch 1, no autograd), on the CPU it ran on. A deployed monitor makes one such call per step. Features are assumed already extracted, so this is what fusion adds on top of the VLA. `metrics.json` also keeps `ms_per_step_amortized` (whole episode in one call, divided by its steps), which is much smaller and is not the online cost.
   - The unseen-test columns stay empty until N3.
 
 `search` adds `search.csv`, `best.json` and `sheet_rows.csv`, plus one `hp_<grid point>/` run per grid point. `kcurve` adds `K<k>/` runs (and `ref_L<l>/` with `--reference-layer`), `k_curve.csv` and `sheet_rows.csv`. `k_curve.csv` gives each K's change in points against K = 1 and against the best single layer.

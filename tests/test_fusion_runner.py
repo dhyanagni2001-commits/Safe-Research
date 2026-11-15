@@ -520,3 +520,22 @@ def test_runner_works_with_the_other_fusion_models(cache, tmp_path, model):
     s = FR.run(cfg(tmp_path / model, model=model, cache=str(cache), seeds=[0], epochs=1, bootstrap=20,
                    save_checkpoints=False))
     assert s["sheet_row"]["Parameters"] > 0 and "ci" in s["metrics"]["roc_auc"]
+
+
+@pytest.mark.parametrize("model", ["concat_fusion", "static_weight_fusion"])
+def test_latency_is_one_call_per_timestep_and_one_step_scores_match(model):
+    """The online latency times a one-step call; that is valid only if a step's score does not depend on other steps."""
+    recs = make_synthetic_records(n=4, t=9, k=2, d=8, seed=1)
+    c = FR.RunConfig(model=model, layers=[0, 1], output_dir="unused", synthetic=True, proj_dim=4 if model ==
+                     "static_weight_fusion" else None)
+    m = FR.get_model(model, **FR.model_kwargs(c, 8))
+    full = FR.timestep_logits(m, recs, batch_size=4)
+    for r, ref in zip(recs, full):
+        steps = [FR.timestep_logits(m, [{**r, "features": r["features"][:, t:t + 1], "mask": r["mask"][:, t:t + 1]}],
+                                    1)[0] for t in range(int(r["mask"].sum()))]
+        assert torch.allclose(torch.cat(steps), ref, atol=1e-6)
+    m.train()
+    lat = FR.measure_latency(m, recs, steps_per_episode=3, warmup=1)
+    assert m.training  # mode restored
+    assert lat["n_calls"] == 4 * 3 and lat["ms_per_step"] > 0 and lat["ms_per_step_amortized"] > 0
+    assert "one call per step" in lat["definition"]
