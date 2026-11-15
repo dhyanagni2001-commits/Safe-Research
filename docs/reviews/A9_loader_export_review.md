@@ -19,7 +19,10 @@ It exports train and seen_val, loads them back through FeatureStore, and checks 
 - the episode counts match `episodes.csv`;
 - every episode has `min(length, task_min_step)` steps;
 - the features are bit-identical to `records()`;
-- the metadata is right.
+- the metadata is right;
+- the raw layer files are float16 `[rows, 4096]`, with rows matching `episodes.csv`.
+
+It compares the counts with the numbers published for the shared v1 cache (train 210 / 108 / 86,823, seen_val 140 / 71 / 57,222) and prints a `NOTE`, not a failure, on a different copy. On the shared cache, `unseen_test/` is permission-locked. The loader now reports that as a clear `PermissionError` ("withheld until the locked final benchmark") instead of a bare stat error. This check works with the lock, unlike `check_cache.py verify`.
 
 It also prints the smallest train std per layer (see the std-floor note). It ends with `A9 PASS` or `A9 FAIL` and never touches `unseen_test`.
 

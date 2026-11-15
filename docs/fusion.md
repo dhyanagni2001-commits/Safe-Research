@@ -11,14 +11,32 @@
 - **Static learned weights** (`failure_prob/models/static_weight_fusion.py`) compute `gamma · Σ_k softmax(α)_k · P_k(x_k)`. Each layer first goes through its own `Linear(D, 64)` into a shared 64-d space ("project features to shared dimension"). The weights are one scalar per layer, the same for every timestep and episode. With `proj_dim = hidden_dim = 64`, F3 has about the same number of parameters as concatenating the same layers (K·4096·64), so F3 vs F2 is a parameter-matched comparison. Without `--proj-dim` it is a pure scalar mix of the z-scored layers, and `--fixed-weights` freezes the mix (uniform, the S6 reference).
 - **Probe heads:** both models take `head="mlp"` (default) or `"linear"` (`failure_prob/models/probe_heads.py`). Once B6 fixes the probe, pass its head, width and budget as flags.
 
+## The shared cache on CARC
+
+The cache is `/scratch1/akashrav/safe_cache/v1`: 34 layers (`L00`–`L33`), poolings `mean`/`first`/`last`, float16 `[rows, 4096]` files.
+
+| Split | Tasks | Episodes | Failures | Rows | Access |
+|---|---|---|---|---|---|
+| train | 7 seen, 30 each | 210 | 108 | 86,823 | read |
+| seen_val | 7 seen, 20 each | 140 | 71 | 57,222 | read |
+| unseen_test | 0, 3, 5 | 150 | 58 | 54,555 | **locked** (owner only) until N3 |
+
+- **Access.** Jobs run under the team's CARC project account. Check that you are in it with `sacctmgr show assoc user=$USER format=account`, then `export SBATCH_ACCOUNT=<account>` once per shell (or pass `--account`). If the account is missing, or `sbatch` says "Invalid account", ask Akash.
+- **Always use the full path.** `/scratch1/akashrav` is pass-through only, so `ls` on it fails by design.
+- **The lock is expected.** unseen_test is permission-locked. These tools only read train and seen_val, and they are tested on a copy with the same lock (`tests/test_locked_unseen.py`). `check_cache.py verify` crashes on the lock, so don't run it on the shared cache. The A9 check below is the read-only check to use instead.
+- **Read only.** Never write into the cache. Outputs go to your checkout or `/scratch1/$USER`.
+- **Use a compute node, not the login node.** Use `sbatch` as below, or `salloc -p main -c 4 --mem=32G -t 01:00:00` for interactive work.
+- **Report results** as "single fixed split (SAFE seed-0 unseen tasks)". Every output already says so. Don't put them next to SAFE's published numbers, which average three splits.
+
 ## Run on CARC (Slurm, CPU)
 
-`scripts/carc/fusion.slurm` wraps every command below. It defaults to 8 CPUs, 32G and 4 h; override with `sbatch --mem=... --time=...`.
+`scripts/carc/fusion.slurm` wraps every command below. It defaults to 8 CPUs, 32G and 4 h; override with `sbatch --mem=... --time=...`. Python: `FUSION_PYTHON`, else the kit venv `$WORK/venv310`, else `python3` on your PATH (e.g. an activated conda env).
 
 ```bash
 cd Safe-Research && mkdir -p logs            # Slurm writes logs/fusion-<job>.out (git-ignored)
-export CACHE=<shared cache v1/ folder>
-sbatch scripts/carc/fusion.slurm a9 --cache "$CACHE" --out "$TMPDIR/a9_fs" --layers 33        # A9 done-check
+export SBATCH_ACCOUNT=<team CARC account>
+export CACHE=/scratch1/akashrav/safe_cache/v1
+sbatch scripts/carc/fusion.slurm a9 --cache "$CACHE" --out /scratch1/$USER/a9_fs --layers 33   # A9 done-check
 sbatch scripts/carc/fusion.slurm search --model concat_fusion --layers A B --cache "$CACHE" \
        --output-dir outputs/fusion/F1 --label "F1 two-layer concat"
 sbatch scripts/carc/fusion.slurm kcurve --model concat_fusion --layers A B C D --reference-layer R \

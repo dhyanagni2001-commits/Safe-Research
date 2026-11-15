@@ -41,10 +41,16 @@ class SharedCache:
         key = (pool, split, layer)
         if key not in self._mm:
             path = self.root / "features" / pool / split / f"L{layer:02d}.npy"
-            if not path.exists():
-                hint = " (unseen features are withheld until the locked final benchmark)" if split == "unseen_test" else ""
+            hint = " (unseen features are withheld until the locked final benchmark)" if split == "unseen_test" else ""
+            try:  # on the shared CARC cache unseen_test/ is drwx------: even exists() is a PermissionError there
+                present = path.exists()
+                if present:
+                    self._mm[key] = np.load(path, mmap_mode="r")
+            except PermissionError:
+                raise PermissionError(f"{path}: permission denied{hint or ' (ask the cache owner for read access)'}") \
+                    from None
+            if not present:
                 raise FileNotFoundError(f"{path} not present in this copy of the cache{hint}")
-            self._mm[key] = np.load(path, mmap_mode="r")
         return self._mm[key]
 
     def norm_stats(self, pool: str, layers: list[int]) -> tuple[np.ndarray, np.ndarray]:
