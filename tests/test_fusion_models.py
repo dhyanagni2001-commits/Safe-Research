@@ -168,3 +168,17 @@ def test_projection_with_fixed_uniform_weights_and_k1():
     m = get_model("static_weight_fusion", input_dim=8, num_layers=1, hidden_dim=4, proj_dim=4, learn_weights=False)
     b = batch(k=1, d=8)
     assert m(b).failure_logits.shape == b["mask"].shape
+
+
+def test_fixed_weights_is_the_s5_s6_feature_average_baseline():
+    """S5/S6 definition (Rhea): z-score each layer with train-only stats (the runner/loader does this), AVERAGE THE
+    FEATURES, then ONE probe. static_weight_fusion --fixed-weights (no --proj-dim) must be exactly that: no score
+    averaging, no weights after the probe, nothing trainable outside the probe head."""
+    import torch
+    from failure_prob.models import get_model
+    m = get_model("static_weight_fusion", input_dim=8, num_layers=3, hidden_dim=4, learn_weights=False).eval()
+    x = torch.randn(2, 5, 3, 8)
+    out = m({"features": x, "mask": torch.ones(2, 5, dtype=torch.bool), "labels": torch.zeros(2)}).failure_logits
+    ref = m.head(x.mean(dim=2))
+    assert torch.allclose(out.reshape(ref.shape), ref, atol=1e-6)
+    assert not [n for n, p in m.named_parameters() if p.requires_grad and not n.startswith("head")]
