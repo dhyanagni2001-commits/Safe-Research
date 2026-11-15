@@ -53,6 +53,8 @@ def common_parser() -> argparse.ArgumentParser:
     p.add_argument("--aggregation", default="max", choices=AGGREGATIONS, help="episode score from step logits")
     p.add_argument("--evaluator", default=None, help="shared evaluator (B4): a depth-sweep registered name or "
                    "'package.module:factory'; default: the built-in provisional scorer")
+    p.add_argument("--allow-duplicate-layers", action="store_true",
+                   help="allow a layer more than once, e.g. --layers 33 33 33 (duplicate-strongest-layer control)")
     p.add_argument("--fixed-weights", dest="learn_weights", action="store_false",
                    help="static_weight_fusion: freeze the mix at --init-weights (uniform if omitted)")
     p.add_argument("--init-weights", type=float, nargs="+", help="static_weight_fusion: one value per layer")

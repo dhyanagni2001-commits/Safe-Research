@@ -539,3 +539,24 @@ def test_latency_is_one_call_per_timestep_and_one_step_scores_match(model):
     assert m.training  # mode restored
     assert lat["n_calls"] == 4 * 3 and lat["ms_per_step"] > 0 and lat["ms_per_step_amortized"] > 0
     assert "one call per step" in lat["definition"]
+
+
+def test_duplicate_layers_only_with_the_flag_and_copied_from_one_read(cache, tmp_path, monkeypatch):
+    """Row 35 (K4, duplicate-strongest-layer control) feeds one layer several times into the winning fusion."""
+    with pytest.raises(ValueError, match="allow-duplicate-layers"):
+        FR.validate_config(cfg(tmp_path / "x", cache=str(cache), layers=[33, 33]))
+    reads = []
+    orig = FR._preload_sequential
+    monkeypatch.setattr(FR, "_preload_sequential", lambda c, pool, split, layers: (reads.append(list(layers)),
+                                                                                    orig(c, pool, split, layers))[1])
+    c = cfg(tmp_path / "dup", cache=str(cache), layers=[33, 33, 16], allow_duplicate_layers=True, seeds=[0])
+    splits, prov = FR.load_cache_splits(c)
+    assert reads == [[33, 16], [33, 16]]  # each layer file read once per split
+    single, _ = FR.load_cache_splits(cfg(tmp_path / "one", cache=str(cache), layers=[33, 16]))
+    for a, b in zip(splits["seen_val"], single["seen_val"]):
+        assert torch.equal(a["features"][:, :, 0], b["features"][:, :, 0])
+        assert torch.equal(a["features"][:, :, 1], b["features"][:, :, 0])
+        assert torch.equal(a["features"][:, :, 2], b["features"][:, :, 1])
+    assert prov["duplicate_layers"] and len(prov["layer_names"]) == 3
+    s = FR.run(c)
+    assert s["layers"] == [33, 33, 16]

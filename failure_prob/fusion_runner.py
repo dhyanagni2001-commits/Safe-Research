@@ -133,6 +133,7 @@ class RunConfig:
     init_weights: list[float] | None = None  # static_weight_fusion only
     proj_dim: int | None = None         # static_weight_fusion only: per-layer projection to a shared dimension
     std_floor: float | None = None      # normalize with max(train std, std_floor) instead of the loader's 1e-6 floor
+    allow_duplicate_layers: bool = False  # K4 control (row 35): the same layer several times, e.g. [33, 33, 33]
     bootstrap: int = 1000               # stratified bootstrap resamples of seen_val episodes for CIs (0 = off)
     ci: float = 0.95                    # CI level
     latency_device: str = "cpu"         # cpu | cuda
@@ -154,8 +155,9 @@ def validate_config(cfg: RunConfig, need_source: bool = True) -> None:
     if any(not isinstance(l, (int, np.integer)) or isinstance(l, bool) for l in cfg.layers):
         raise ValueError(f"layers must be integers, got {cfg.layers}")
     dup = sorted({l for l in cfg.layers if list(cfg.layers).count(l) > 1})
-    if dup:
-        raise ValueError(f"duplicate layers {dup}: each layer may appear once")
+    if dup and not cfg.allow_duplicate_layers:
+        raise ValueError(f"duplicate layers {dup}: each layer may appear once (allow_duplicate_layers=True / "
+                         f"--allow-duplicate-layers for the duplicate-strongest-layer control)")
     if cfg.horizon not in HORIZONS:
         raise ValueError(f"horizon must be one of {HORIZONS}, got {cfg.horizon!r}")
     if cfg.train_horizon not in HORIZONS:
@@ -260,7 +262,21 @@ def _preload_sequential(cache, pool: str, split: str, layers) -> None:
 
 
 def load_cache_splits(cfg: RunConfig) -> tuple[dict[str, list[dict]], dict]:
-    """train + seen_val records from the shared cache, plus provenance. Never requests unseen_test."""
+    """train + seen_val records from the shared cache, plus provenance. Never requests unseen_test.
+
+    Repeated layers (allow_duplicate_layers) are read once and then copied into their K slots."""
+    unique = list(dict.fromkeys(cfg.layers))
+    if len(unique) != len(cfg.layers):
+        from dataclasses import replace
+        out, prov = load_cache_splits(replace(cfg, layers=unique, allow_duplicate_layers=False))
+        idx = [unique.index(l) for l in cfg.layers]
+        for recs in out.values():
+            for r in recs:
+                r["features"] = r["features"][:, :, idx].contiguous()
+        if prov.get("layer_names"):
+            prov["layer_names"] = [prov["layer_names"][i] for i in idx]
+        prov["duplicate_layers"] = True
+        return out, prov
     cache = _shared_cache(cfg.cache)
     names = getattr(cache, "layer_names", None)
     if names is not None:

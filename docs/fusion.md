@@ -100,7 +100,9 @@ Until S1–S3 pick the layers, any layers run, but the numbers are development n
 
 **Latency:** `--latency-device cuda` measures on a GPU when one is visible. The Slurm job is CPU-only.
 
-**Shared evaluator (B4):** pass `--evaluator package.module:factory`, or a name registered in the depth sweep's `sweep_plugins.EVALUATORS` (PR #4, e.g. `temporary_max`). The contract is the sweep's: `Evaluator(EvalInput) -> dict`. The evaluator gets per-step scores (logits) of every seen_val episode, already cut to `task_min_step`. Once a non-TEMPORARY evaluator is used, the `episode_scorer` provisional flag disappears from every output.
+**Shared evaluator (B4, merged on main as PR #5):** use `--evaluator failure_prob.engine.episode_metrics:make_evaluator` for every reportable run (SAFE-equivalent; PR-AUC is computed as SAFE does, so it can differ slightly from the built-in scorer; adds `roc_auc_taskmean`). In general: pass `--evaluator package.module:factory`, or a name registered in the depth sweep's `sweep_plugins.EVALUATORS` (PR #4, e.g. `temporary_max`). The contract is the sweep's: `Evaluator(EvalInput) -> dict`. The evaluator gets per-step scores (logits) of every seen_val episode, already cut to `task_min_step`. Once a non-TEMPORARY evaluator is used, the `episode_scorer` provisional flag disappears from every output.
+
+**Duplicate-strongest-layer control (row 35, K4):** `--allow-duplicate-layers --layers 33 33 33` feeds one layer K times into the same fusion model. The layer file is read once per split.
 
 ## Output
 
